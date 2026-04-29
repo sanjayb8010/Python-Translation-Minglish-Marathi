@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>English → Marathi</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 44rem; margin: 1.5rem auto; padding: 0 1rem; color: #1a1a1a; }
+    label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+    textarea { width: 100%; box-sizing: border-box; padding: 0.5rem; border: 1px solid #bbb; border-radius: 8px; }
+    textarea { min-height: 7rem; resize: vertical; font-size: 1rem; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end; margin-top: 0.75rem; }
+    .err { color: #b00020; }
+    .out { white-space: pre-wrap; background: linear-gradient(#f8f8fc, #f0f0f8); padding: 0.85rem 1rem; border-radius: 10px; min-height: 3rem; border: 1px solid #e0e0ea; font-size: 1.05rem; line-height: 1.5; }
+    .hint { color: #444; font-size: 0.875rem; margin-top: 0.85rem; }
+    .muted { color: #666; font-size: 0.85rem; font-weight: 500; margin-top: 0.5rem; }
+    #live-status { font-size: 0.8rem; color: #666; margin: 0.25rem 0 0; min-height: 1.25em; }
+    .panel { margin-top: 1rem; }
+    #suggestions { display: flex; flex-wrap: wrap; gap: 0.35rem 0.5rem; margin-top: 0.35rem; min-height: 0; align-items: center; }
+    .chip { font: inherit; font-size: 0.875rem; padding: 0.35rem 0.65rem; border-radius: 999px; border: 1px solid #aab; background: #fff; cursor: pointer; transition: background 0.12s ease, transform 0.08s ease; max-width: 100%; }
+    .chip:hover { background: #eef0ff; border-color: #88a; }
+    .chip:active { transform: scale(0.98); }
+    .chip[disabled] { opacity: 0.6; cursor: default; }
+    .toast { font-size: 0.8rem; color: #065; margin-left: 0.35rem; }
+    h2 { font-size: 1rem; font-weight: 600; margin: 1rem 0 0.35rem; }
+    .sug-loading { font-size: 0.85rem; color: #555; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>English → Marathi</h1>
+  {% if error %}<p class="err">{{ error }}</p>{% endif %}
+  <form id="main-form" method="post" action="">
+    <label for="english">English input <span class="muted">(live preview after you pause typing; spelling suggestions optional — see checkbox below)</span></label>
+    <textarea id="english" name="english" rows="5" autofocus>{{ english }}</textarea>
+    <p class="muted" style="margin-top:0.5rem;">
+      <label style="display:inline-flex; align-items:center; gap:0.4rem; cursor:pointer;">
+        <input type="checkbox" id="live-suggest-enabled" />
+        Show spelling suggestions (extra API call — leave off for fastest translation)
+      </label>
+    </p>
+    <p id="live-status" aria-live="polite"></p>
+    <div class="row">
+      <p class="muted" style="margin:0;">Output: minglish · Mode: auto (fixed)</p>
+      <button type="submit" name="action" value="translate">Translate</button>
+      <button type="submit" name="action" value="clear">Clear</button>
+    </div>
+  </form>
+
+  <div class="panel">
+    <h2>Live Marathi preview</h2>
+    <div id="live-out" class="out">{{ output if output else "Start typing English above — output appears here shortly after you pause." }}</div>
+
+    <h2>Suggestions</h2>
+    <p id="suggest-hint" class="muted">Suggestions use the word you’re still typing at the end of the box (needs 2+ letters). Tap a suggestion to copy.</p>
+    <div id="suggestions" aria-label="Transliteration alternatives"></div>
+    <span id="copy-toast" class="toast" aria-live="polite"></span>
+  </div>
+
+  {% if api_base %}
+  <p class="hint">REST base URL: <code>{{ api_base }}</code> — e.g. <code>{{ api_base }}{{ api_prefix }}/translate</code> with JSON.</p>
+  {% else %}
+  <p class="hint">REST: <code>POST {{ api_prefix }}/translate</code> and <code>POST {{ api_prefix }}/suggest</code> · <code>GET {{ api_prefix }}/health</code></p>
+  {% endif %}
+
+<script>
+(function () {
+  var API_BASE = {{ (api_base or "")|tojson }};
+  var API_PREFIX = {{ api_prefix | tojson }};
+  /** One pause for both preview + suggestions; lower = quicker updates (more API calls). */
+  var DEBOUNCE_LIVE_MS = 400;
+
+  var english = document.getElementById("english");
+  var liveOut = document.getElementById("live-out");
+  var liveStatus = document.getElementById("live-status");
+  var sugHint = document.getElementById("suggest-hint");
+  var suggestionsEl = document.getElementById("suggestions");
+  var toast = document.getElementById("copy-toast");
+  var sugEnabled = document.getElementById("live-suggest-enabled");
+  try {
+    if (localStorage.getItem("liveSuggest") === "1") sugEnabled.checked = true;
+  } catch (e) {}
+  sugEnabled.addEventListener("change", function () {
+    try { localStorage.setItem("liveSuggest", sugEnabled.checked ? "1" : "0"); } catch (e) {}
+    runLiveUpdates();
+  });
+
+  /** REST base: optional cross-origin api_base + canonical ``/api/v1`` routes (same-origin: API_BASE blank). */
+  function apiUrl(suffixPath) {
+    var b = typeof API_BASE === "string" ? API_BASE.replace(/\/+$/, "") : "";
+    var p = typeof API_PREFIX === "string" ? API_PREFIX.replace(/\/+$/, "") : "/api/v1";
+    var s = suffixPath.charAt(0) === "/" ? suffixPath : "/" + suffixPath;
+    return b + p + s;
+  }
+
+  function debounce(fn, ms) {
+    var t = null;
+    return function () {
+      var ctx = this, args = arguments;
+      clearTimeout(t);
+      t = setTimeout(function () { fn.apply(ctx, args); }, ms);
+    };
+  }
+
+  var liveBatch = 0;
+  var ctrlTranslate = null;
+  var ctrlSuggest = null;
+
+  function abortCtrl(ctrl) {
+    if (ctrl) {
+      try { ctrl.abort(); } catch (e) {}
+    }
+  }
+
+  function lastFragment(text) {
+    var t = (text || "").replace(/\s+$/, "");
+    var parts = t.split(/\s+/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "";
+  }
+
+  function attachChip(txt) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "chip";
+    btn.textContent = txt;
+    btn.addEventListener("click", async function () {
+      try {
+        await navigator.clipboard.writeText(txt);
+        toast.textContent = "Copied.";
+        setTimeout(function () { toast.textContent = ""; }, 1400);
+      } catch (err) {
+        toast.textContent = "Copy blocked.";
+      }
+    });
+    suggestionsEl.appendChild(btn);
+  }
+
+  async function runLiveUpdates() {
+    var raw = english.value || "";
+    var trimmed = raw.trim();
+
+    abortCtrl(ctrlTranslate);
+    abortCtrl(ctrlSuggest);
+    ctrlTranslate = new AbortController();
+    ctrlSuggest = new AbortController();
+
+    if (!trimmed) {
+      liveOut.textContent = "Start typing English above — output appears shortly after you pause.";
+      liveStatus.textContent = "";
+      suggestionsEl.innerHTML = "";
+      sugHint.textContent =
+        "Turn on spelling suggestions below to see alternatives while you type.";
+      return;
+    }
+
+    liveBatch++;
+    var myBatch = liveBatch;
+    var wantSug = !!(sugEnabled && sugEnabled.checked);
+    liveStatus.textContent = wantSug ? "Translating (with suggestions)…" : "Translating…";
+
+    var frag = lastFragment(raw);
+
+    function doTranslate() {
+      return fetch(apiUrl("/translate"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: trimmed }),
+        signal: ctrlTranslate.signal
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          return { res: res, body: body };
+        });
+      });
+    }
+
+    function doSuggest() {
+      if (frag.length < 2) {
+        suggestionsEl.innerHTML = "";
+        sugHint.textContent =
+          "Alternatives need 2+ letters in the last word — keep typing.";
+        return Promise.resolve({ res: { ok: true }, body: { suggestions: [] } });
+      }
+      suggestionsEl.innerHTML = "";
+      var span = document.createElement("span");
+      span.className = "sug-loading";
+      span.textContent = "Loading suggestions…";
+      suggestionsEl.appendChild(span);
+
+      return fetch(apiUrl("/suggest"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: raw }),
+        signal: ctrlSuggest.signal
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          return { res: res, body: body };
+        });
+      });
+    }
+
+    try {
+      var results = await Promise.allSettled(
+        wantSug ? [doTranslate(), doSuggest()] : [doTranslate()]
+      );
+      if (myBatch !== liveBatch) return;
+
+      var tr = results[0];
+      if (tr.status === "fulfilled") {
+        var pack = tr.value;
+        if (pack.res.ok && pack.body && pack.body.text != null) {
+          liveOut.textContent = pack.body.text || "";
+        } else {
+          liveOut.textContent =
+            (pack.body && (pack.body.message || pack.body.detail)) || ("Error " + pack.res.status);
+        }
+      } else if (tr.reason && tr.reason.name !== "AbortError") {
+        liveOut.textContent = "Network error.";
+      }
+
+      suggestionsEl.innerHTML = "";
+      if (!wantSug) {
+        sugHint.textContent =
+          "Spelling suggestions are off — check “Show spelling suggestions” above for faster translation only, or enable for word alternatives.";
+        return;
+      }
+
+      var sr = results[1];
+      if (frag.length >= 2) {
+        if (sr.status === "fulfilled") {
+          var sp = sr.value;
+          if (sp.res.ok && sp.body && sp.body.suggestions) {
+            var f = sp.body.fragment || frag;
+            sugHint.textContent = f ? "Alternatives for “" + f + "” (click to copy):" : "Alternatives (click to copy):";
+            (sp.body.suggestions || []).forEach(function (txt) {
+              if (txt) attachChip(txt);
+            });
+            if (!sp.body.suggestions.length) {
+              sugHint.textContent = "No variants for “" + (f || "…") + "”.";
+            }
+          } else {
+            sugHint.textContent =
+              (sp.body && sp.body.message) || ("Suggestions failed (" + sp.res.status + ").");
+          }
+        } else if (sr.reason && sr.reason.name !== "AbortError") {
+          sugHint.textContent = "Could not load suggestions.";
+        }
+      }
+    } finally {
+      if (myBatch === liveBatch) {
+        liveStatus.textContent = "";
+      }
+    }
+  }
+
+  var onLiveDebounced = debounce(runLiveUpdates, DEBOUNCE_LIVE_MS);
+
+  function bindLive() {
+    english.addEventListener("input", onLiveDebounced);
+    if ((english.value || "").trim()) {
+      runLiveUpdates();
+    }
+  }
+
+  bindLive();
+})();
+</script>
+</body>
+</html>
