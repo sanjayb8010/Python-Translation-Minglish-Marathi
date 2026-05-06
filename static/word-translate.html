@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Word translate (API)</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 36rem; margin: 1.5rem auto; padding: 0 1rem; }
+    label { display: block; font-weight: 600; margin-bottom: 0.35rem; }
+    textarea, input[type="text"] { width: 100%; box-sizing: border-box; font: inherit; }
+    textarea { min-height: 6rem; padding: 0.5rem; border-radius: 8px; border: 1px solid #888; }
+    .row { margin: 1rem 0 0; }
+    .out { padding: 0.65rem 0.85rem; border-radius: 8px; border: 1px solid #888; min-height: 2.75rem; white-space: pre-wrap; background: rgba(127,127,127,0.08); }
+    .hint { font-size: 0.875rem; color: #555; margin: 0.5rem 0 0; }
+    .muted { opacity: 0.75; }
+    .err { color: #b00020; font-size: 0.875rem; margin-top: 0.35rem; }
+    code { font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1 style="font-size:1.25rem; margin-bottom:1rem;">Word-by-word translation</h1>
+
+  <label for="api-base">API base URL <span class="muted">(empty = same site, e.g. when opened from server)</span></label>
+  <input id="api-base" type="text" spellcheck="false" placeholder="http://127.0.0.1:5000"
+    autocomplete="off" />
+
+  <div class="row">
+    <label for="english">Type English — each time you finish a word with <kbd>Space</kbd> (or newline), it is translated</label>
+    <textarea id="english" placeholder="Try: hello world " autofocus></textarea>
+    <p class="hint">
+      Sends <code>POST …/api/v1/translate</code> with <code>{ "text": "&lt;word&gt;" }</code>.
+      Marathi (<code>text</code> in JSON) appears below for the latest completed word.
+    </p>
+  </div>
+
+  <div class="row">
+    <label for="marathi">Latest word — Marathi</label>
+    <div id="marathi" class="out" aria-live="polite">—</div>
+    <div id="err" class="err" role="status" hidden></div>
+  </div>
+
+<script>
+(function () {
+  /**
+   * @param {string} path Absolute path beginning with '/', e.g. '/api/v1/translate'
+   */
+  function apiUrl(path) {
+    var base = (document.getElementById("api-base").value || "").trim().replace(/\/+$/, "");
+    return base ? base + path : path;
+  }
+
+  var englishEl = document.getElementById("english");
+  var marathiEl = document.getElementById("marathi");
+  var errEl = document.getElementById("err");
+  /** How many whitespace-terminated words we've already sent to the API */
+  var lastEmittedCount = 0;
+  /** Keep UI snappy on repeated words and avoid re-hitting API. */
+  var wordCache = new Map();
+  /** Ignore stale responses when user types quickly. */
+  var activeRequestId = 0;
+  var activeController = null;
+
+  function setError(msg) {
+    if (!msg) {
+      errEl.hidden = true;
+      errEl.textContent = "";
+      return;
+    }
+    errEl.hidden = false;
+    errEl.textContent = msg;
+  }
+
+  function stripWord(w) {
+    return w.trim();
+  }
+
+  async function translate(word) {
+    var normalized = word.toLowerCase();
+    if (wordCache.has(normalized)) {
+      setError("");
+      marathiEl.textContent = wordCache.get(normalized);
+      return;
+    }
+
+    activeRequestId += 1;
+    var requestId = activeRequestId;
+    if (activeController) {
+      try { activeController.abort(); } catch (e) {}
+    }
+    activeController = new AbortController();
+
+    setError("");
+    marathiEl.textContent = "Translating...";
+    var res = await fetch(apiUrl("/api/v1/translate"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ text: word }),
+      signal: activeController.signal,
+    });
+    if (requestId !== activeRequestId) return;
+    var data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      if (requestId !== activeRequestId) return;
+      setError("Invalid JSON response (HTTP " + res.status + ").");
+      marathiEl.textContent = "—";
+      return;
+    }
+    if (!res.ok) {
+      if (requestId !== activeRequestId) return;
+      marathiEl.textContent = "—";
+      var msg =
+        typeof data.message === "string"
+          ? data.message
+          : data.error || "Request failed.";
+      setError(msg + " (HTTP " + res.status + ")");
+      return;
+    }
+    if (requestId !== activeRequestId) return;
+    var translated = typeof data.text === "string" ? data.text : "—";
+    marathiEl.textContent = translated;
+    if (translated && translated !== "—") {
+      wordCache.set(normalized, translated);
+    }
+  }
+
+  englishEl.addEventListener("input", function () {
+    var t = englishEl.value;
+    var withoutTrailingWs = t.replace(/\s+$/, "");
+
+    /* No trailing whitespace → still typing current word — only sync counter on shrink */
+    if (!/\s$/.test(t)) {
+      var partsIncomplete = withoutTrailingWs.split(/\s+/).filter(Boolean);
+      if (partsIncomplete.length < lastEmittedCount) {
+        lastEmittedCount = partsIncomplete.length;
+        setError("");
+      }
+      return;
+    }
+
+    var parts = withoutTrailingWs.split(/\s+/).filter(Boolean);
+    if (parts.length < lastEmittedCount) {
+      lastEmittedCount = parts.length;
+      setError("");
+      return;
+    }
+    if (parts.length === lastEmittedCount) return;
+
+    lastEmittedCount = parts.length;
+    var word = stripWord(parts[parts.length - 1]);
+    if (!word) return;
+
+    translate(word).catch(function (e) {
+      if (e && e.name === "AbortError") return;
+      marathiEl.textContent = "—";
+      setError(String(e && e.message ? e.message : e));
+    });
+  });
+})();
+</script>
+</body>
+</html>

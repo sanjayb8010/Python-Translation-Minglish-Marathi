@@ -8,6 +8,7 @@ POC: English → Marathi (and styles) via Azure OpenAI, aligned with the prior F
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -19,6 +20,7 @@ from flask import Blueprint, Flask, jsonify, render_template, request
 from flask_cors import CORS
 from openai import AzureOpenAI, OpenAIError
 
+_log = logging.getLogger(__name__)
 _root = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(_root, ".env")
 INPUT_FILE = os.path.join(_root, "input.txt")
@@ -55,6 +57,25 @@ AZURE_OPENAI_API_VERSION = os.getenv(
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
 OUTPUT_STYLE = "minglish"
 TASK_MODE = "auto"
+
+
+def _env_truthy(name: str) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _expose_upstream_detail() -> bool:
+    """Include Azure/OpenAI failure text in API JSON (avoid in production-facing hosts)."""
+    return _env_truthy("AZURE_OPENAI_VERBOSE_ERRORS") or (
+        os.environ.get("FLASK_DEBUG") == "1"
+    )
+
+
+def _upstream_api_message(exc: BaseException | None, generic: str) -> str:
+    if _expose_upstream_detail() and exc:
+        return str(exc)
+    return generic
+
 
 # Optional: public base URL of this API (no trailing slash). Set when the HTML is opened
 # from another domain (e.g. PHP on cPanel) so fetches target the Python host.
@@ -98,19 +119,22 @@ def _deployment_is_reasoning(deployment_name: str) -> bool:
 def _reasoning_effort_param(deployment_name: str) -> str | None:
     if not _deployment_is_reasoning(deployment_name):
         return None
-    raw = (os.getenv("AZURE_OPENAI_REASONING_EFFORT", "minimal") or "").strip()
+    raw = (os.getenv("AZURE_OPENAI_REASONING_EFFORT", "off") or "").strip()
     if raw.lower() in ("", "off", "false", "none"):
         return None
     if raw in ("minimal", "low", "medium", "high"):
         return raw
-    return "minimal"
+    return None
 
 
 def _translate_completion_budget(text: str, deployment_name: str) -> int:
     base = _completion_budget_translate(text)
     if not _deployment_is_reasoning(deployment_name):
         return base
-    floor = int(os.getenv("TRANSLATE_MIN_COMPLETION_TOKENS", "8192") or "8192")
+    floor = int(os.getenv("TRANSLATE_MIN_COMPLETION_TOKENS", "512") or "512")
+    # For short word/phrase live-preview inputs, keep budget tight for lower latency.
+    if len((text or "").strip()) <= 24:
+        floor = min(floor, 256)
     return max(base, floor)
 
 
@@ -118,7 +142,7 @@ def _suggest_completion_cap(dep: str) -> int:
     base = max(256, _completion_budget_suggest())
     if not _deployment_is_reasoning(dep):
         return base
-    floor = int(os.getenv("SUGGEST_MIN_COMPLETION_TOKENS", "2048") or "2048")
+    floor = int(os.getenv("SUGGEST_MIN_COMPLETION_TOKENS", "256") or "256")
     return max(base, floor)
 
 
@@ -652,9 +676,15 @@ def _api_translate_json() -> tuple[Any, int] | Any:
         result = convert_text(text, output_style=o_style, task_mode=t_mode)
     except ValueError as e:
         return jsonify({"error": "configuration_error", "message": str(e)}), 503
-    except RuntimeError:
+    except RuntimeError as e:
+        _log.warning("Upstream translate failure: %s", e, exc_info=True)
         return jsonify(
-            {"error": "upstream_error", "message": "Azure OpenAI request failed."}
+            {
+                "error": "upstream_error",
+                "message": _upstream_api_message(
+                    e, "Azure OpenAI request failed."
+                ),
+            }
         ), 502
     if not result:
         return jsonify(
@@ -703,9 +733,15 @@ def _api_suggest_json() -> tuple[Any, int] | Any:
         )
     except ValueError as e:
         return jsonify({"error": "configuration_error", "message": str(e)}), 503
-    except RuntimeError:
+    except RuntimeError as e:
+        _log.warning("Upstream suggest failure: %s", e, exc_info=True)
         return jsonify(
-            {"error": "upstream_error", "message": "Suggestion request failed."}
+            {
+                "error": "upstream_error",
+                "message": _upstream_api_message(
+                    e, "Suggestion request failed."
+                ),
+            }
         ), 502
     return jsonify(
         fragment=fragment,
